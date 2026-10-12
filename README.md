@@ -28,6 +28,8 @@ Application authors depend on `velo` only. See [Workspace crates](docs/src/devel
 
 Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 
+TCP can return replies on an accepted connection when a restarted receiver has lost the caller's registration. This preserves the wire format and does not authorize new outbound requests. See [TCP replies after a receiver restart](docs/src/concepts/transports.md#tcp-replies-after-a-receiver-restart).
+
 QUIC and TCP can keep several lanes, each its own connection, to one peer. See [TCP lanes](docs/src/concepts/transports.md#tcp-lanes) and [QUIC lanes](docs/src/operations/quic-performance.md#lanes).
 
 Streams through the mux spread over those lanes, and each stream stays on one lane. If the caller gives a key (`attach_anchor_keyed`, `prebind_anchor_keyed`), the receiver places the stream by that key, so streams with one key to one receiver share a lane. The key is a placement hint: the mux never orders records across streams. Without a key, the receiver uses the lane with the least load. See [Lanes](docs/src/concepts/batched-streaming.md#lanes).

@@ -220,6 +220,113 @@ fn make_peer_info(keys: &[&str]) -> PeerInfo {
     PeerInfo::new(instance_id, address)
 }
 
+/// A learned return path is not a substitute for registering peer identity.
+/// It can carry only Response/Ack frames, not new outbound requests or events.
+#[tokio::test]
+async fn reply_routes_do_not_register_peers_or_authorize_requests() {
+    let transport = MockTransport::new("mock", true);
+    let (backend, _) = VeloBackend::new(vec![transport.clone()], None)
+        .await
+        .unwrap();
+    let peer = make_peer_info(&["mock"]);
+    let worker = peer.worker_id();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let route: Arc<ReplyRoute> = Arc::new(move |_, _, _, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        SendOutcome::Admitted
+    });
+    backend
+        .reply_routes
+        .insert(worker, vec![Arc::downgrade(&route)]);
+    for kind in [MessageType::Response, MessageType::Ack] {
+        assert!(
+            backend
+                .send_message_to_worker(
+                    worker,
+                    Bytes::new(),
+                    Bytes::new(),
+                    kind,
+                    Arc::new(NoopErrorHandler)
+                )
+                .unwrap()
+                .is_admitted()
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(backend.try_translate_worker_id(worker).is_err());
+    assert!(!backend.is_registered(peer.instance_id()));
+    for kind in [MessageType::Message, MessageType::Event] {
+        assert!(
+            backend
+                .send_message_to_worker(
+                    worker,
+                    Bytes::new(),
+                    Bytes::new(),
+                    kind,
+                    Arc::new(NoopErrorHandler)
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // A proper registration takes precedence over any learned reply path.
+    backend.register_peer(peer).unwrap();
+    backend
+        .send_message_to_worker(
+            worker,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Response,
+            Arc::new(NoopErrorHandler),
+        )
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(transport.send_count.load(Ordering::SeqCst), 1);
+}
+
+/// Closing one accepted lane must not hide another live lane from that worker.
+/// When all lanes close, the weak registry must not keep either one alive.
+#[tokio::test]
+async fn reply_routes_skip_dead_connections_without_retaining_them() {
+    let transport = MockTransport::new("mock", true);
+    let (backend, _) = VeloBackend::new(vec![transport], None).await.unwrap();
+    let worker = InstanceId::new_v4().worker_id();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let first: Arc<ReplyRoute> = Arc::new(move |_, _, _, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        SendOutcome::Admitted
+    });
+    let last: Arc<ReplyRoute> = Arc::new(|_, _, _, _| panic!("dead route was retained"));
+    backend
+        .reply_routes
+        .insert(worker, vec![Arc::downgrade(&first), Arc::downgrade(&last)]);
+    drop(last);
+    backend
+        .send_message_to_worker(
+            worker,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Ack,
+            Arc::new(NoopErrorHandler),
+        )
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(first);
+    assert!(
+        backend
+            .send_message_to_worker(
+                worker,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Ack,
+                Arc::new(NoopErrorHandler)
+            )
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn test_new_single_transport() {
     let t = MockTransport::new("tcp", true);

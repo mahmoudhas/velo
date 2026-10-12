@@ -654,6 +654,15 @@ pub enum AdmitOutcome {
     },
 }
 
+/// A connection-local return path for response/ack frames. It does not register
+/// a peer address or grant an outbound request route.
+pub type ReplyRoute =
+    dyn Fn(MessageType, Bytes, Bytes, Arc<dyn TransportErrorHandler>) -> SendOutcome + Send + Sync;
+
+/// Installs a weak return path for the sender named by an inbound request header.
+/// The runtime interprets its own header; the transport need not know its schema.
+pub type ReplyRegistration = dyn Fn(&Bytes, std::sync::Weak<ReplyRoute>) + Send + Sync;
+
 /// Sender-side handle given to transports for routing inbound frames.
 ///
 /// Each transport receives a clone of this adapter during [`Transport::start`]
@@ -668,6 +677,8 @@ pub struct TransportAdapter {
     /// Private: every item must carry an [`InFlightGuard`], so the only way to
     /// enqueue is [`admit_message`](Self::admit_message).
     message_stream: flume::Sender<InboundMessage>,
+    reply_registration: Option<Arc<ReplyRegistration>>,
+    reply_route: Option<Arc<ReplyRoute>>,
     /// Channel for inbound [`MessageType::Response`] frames.
     pub response_stream: flume::Sender<(Bytes, Bytes)>,
     /// Channel for inbound [`MessageType::Ack`] and [`MessageType::Event`] frames.
@@ -685,6 +696,18 @@ pub struct TransportAdapter {
 }
 
 impl TransportAdapter {
+    /// Configure runtime return-route registration before transports start.
+    pub fn with_reply_registration(mut self, registration: Arc<ReplyRegistration>) -> Self {
+        self.reply_registration = Some(registration);
+        self
+    }
+
+    /// Bind this adapter clone to one accepted connection's response path.
+    pub fn with_reply_route(mut self, route: Arc<ReplyRoute>) -> Self {
+        self.reply_route = Some(route);
+        self
+    }
+
     /// Offer an inbound [`MessageType::Message`] frame to the runtime.
     ///
     /// This is the *only* way to enqueue inbound request work, and it is the
@@ -729,6 +752,9 @@ impl TransportAdapter {
             return AdmitOutcome::Draining { header, payload };
         }
 
+        if let (Some(register), Some(route)) = (&self.reply_registration, &self.reply_route) {
+            register(&header, Arc::downgrade(route));
+        }
         match self
             .message_stream
             .send(InboundMessage::new(header, payload, guard))
@@ -813,6 +839,8 @@ pub fn make_channels() -> (TransportAdapter, DataStreams) {
     (
         TransportAdapter {
             message_stream: message_tx,
+            reply_registration: None,
+            reply_route: None,
             response_stream: response_tx,
             event_stream: event_tx,
             shutdown_stream: shutdown_tx,
@@ -908,6 +936,41 @@ mod tests {
         let payloads: Vec<u8> = sent.iter().map(|(_, p)| p[0]).collect();
         assert_eq!(payloads, vec![0, 1, 7]);
         assert!(sent.iter().all(|(t, _)| *t == target));
+    }
+
+    /// Return-path learning happens inside the normal admission path, after
+    /// the guard and drain check. It cannot make a rejected frame runnable.
+    #[test]
+    fn reply_registration_does_not_bypass_drain_admission() {
+        let (adapter, streams) = make_channels();
+        let state = adapter.shutdown_state.clone();
+        let seen_state = state.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let adapter = adapter
+            .with_reply_registration(Arc::new(move |header, route| {
+                assert_eq!(header.as_ref(), b"request");
+                assert!(route.upgrade().is_some());
+                assert_eq!(seen_state.in_flight_count(), 1);
+                seen.fetch_add(1, Ordering::SeqCst);
+            }))
+            .with_reply_route(Arc::new(|_, _, _, _| SendOutcome::Admitted));
+        assert!(matches!(
+            adapter.admit_message(Bytes::from_static(b"request"), Bytes::new()),
+            AdmitOutcome::Admitted
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.in_flight_count(), 1);
+        drop(streams.message_stream.try_recv().unwrap());
+        assert_eq!(state.in_flight_count(), 0);
+        state.begin_drain();
+        assert!(matches!(
+            adapter.admit_message(Bytes::from_static(b"request"), Bytes::new()),
+            AdmitOutcome::Draining { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.in_flight_count(), 0);
+        assert!(streams.message_stream.try_recv().is_err());
     }
 
     #[test]

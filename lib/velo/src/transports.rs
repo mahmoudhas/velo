@@ -66,7 +66,10 @@ pub mod quic;
 
 mod transport;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use crate::observability::{Direction, TransportRejection, VeloMetrics};
 use bytes::Bytes;
@@ -76,7 +79,10 @@ use parking_lot::Mutex;
 // Identity / address types from velo-ext are reachable as `velo::InstanceId`,
 // `velo::PeerInfo`, etc. and via the `velo_ext` crate root. Pulling them in
 // here too is just noise.
+use velo_ext::transport::ReplyRoute;
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
+
+type ReplyRoutes = DashMap<WorkerId, Vec<Weak<ReplyRoute>>>;
 
 // Internal builder for address construction
 use address::WorkerAddressBuilder;
@@ -133,6 +139,9 @@ pub struct VeloBackend {
     primary_transport: DashMap<InstanceId, Arc<dyn Transport>>,
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
+    // Weak, reply-only routes learned from accepted TCP connections. A surviving
+    // sender may retain its _hello cache across this receiver's restart.
+    reply_routes: Arc<ReplyRoutes>,
     shutdown_state: ShutdownState,
 }
 
@@ -193,6 +202,28 @@ impl VeloBackend {
         let mut transport_metrics = HashMap::new();
 
         let (adapter, data_streams) = transport::make_channels();
+        let reply_routes = Arc::new(ReplyRoutes::new());
+        let routes = Arc::clone(&reply_routes);
+        let adapter = adapter.with_reply_registration(Arc::new(move |header, route| {
+            use crate::messenger::common::messages::decode_response_id_from_request_header;
+            let Some(response_id) = decode_response_id_from_request_header(header) else {
+                return;
+            };
+            let worker = WorkerId::from_u64(response_id.worker_id());
+            if routes
+                .get(&worker)
+                .is_some_and(|current| current.iter().any(|p| p.ptr_eq(&route)))
+            {
+                return;
+            }
+            // Prune only when learning a different connection, never per frame.
+            routes.retain(|_, current| current.iter().any(|p| p.strong_count() > 0));
+            let mut current = routes.entry(worker).or_default();
+            current.retain(|p| p.strong_count() > 0);
+            if !current.iter().any(|p| p.ptr_eq(&route)) {
+                current.push(route);
+            }
+        }));
         let shutdown_state = adapter.shutdown_state.clone();
         let mut started = StartupTransports {
             transports: HashMap::new(),
@@ -246,6 +277,7 @@ impl VeloBackend {
                 primary_transport: DashMap::new(),
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
+                reply_routes,
                 shutdown_state,
             },
             data_streams,
@@ -547,7 +579,10 @@ impl VeloBackend {
     /// Send message to a worker (fast-path only).
     ///
     /// This method uses `try_translate_worker_id()` for fast-path lookup.
-    /// Returns `WorkerNotRegistered` error if the worker is not in the cache.
+    /// Response/Ack frames to an unregistered worker may use a live, reply-only
+    /// return path learned from an accepted connection. This does not register
+    /// an instance or permit outbound requests. Otherwise returns
+    /// `WorkerNotRegistered` if the worker is not in the cache.
     ///
     /// For automatic discovery, use the two-phase pattern:
     /// ```ignore
@@ -574,7 +609,21 @@ impl VeloBackend {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<SendOutcome> {
-        let instance_id = self.try_translate_worker_id(worker_id)?;
+        let instance_id = match self.try_translate_worker_id(worker_id) {
+            Ok(instance) => instance,
+            Err(error) => {
+                if matches!(message_type, MessageType::Response | MessageType::Ack) {
+                    let route = self
+                        .reply_routes
+                        .get(&worker_id)
+                        .and_then(|routes| routes.iter().rev().find_map(std::sync::Weak::upgrade));
+                    if let Some(route) = route {
+                        return Ok(route(message_type, header, payload, on_error));
+                    }
+                }
+                return Err(error.into());
+            }
+        };
         self.send_message(instance_id, header, payload, message_type, on_error)
     }
 

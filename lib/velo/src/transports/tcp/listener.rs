@@ -73,6 +73,39 @@ struct ConnectionContext {
     shrink_threshold: usize,
 }
 
+/// One fallback reply. Dropping a queued/current frame on connection failure
+/// must report it even if its admission was already acknowledged.
+struct ReplyFrame {
+    kind: MessageType,
+    header: bytes::Bytes,
+    payload: bytes::Bytes,
+    on_error: Arc<dyn TransportErrorHandler>,
+    runtime: Handle,
+    queued_at: Option<std::time::Instant>,
+    completed: bool,
+    failure: Option<String>,
+}
+
+impl Drop for ReplyFrame {
+    fn drop(&mut self) {
+        if !self.completed {
+            let on_error = self.on_error.clone();
+            let header = self.header.clone();
+            let payload = self.payload.clone();
+            let error = self
+                .failure
+                .take()
+                .unwrap_or_else(|| "TCP reply connection closed before write".into());
+            // A gate can drop a failed frame while holding its queue lock.
+            // Never invoke arbitrary callbacks under that lock: an error
+            // handler is allowed to submit another send.
+            drop(self.runtime.spawn(async move {
+                on_error.on_error(header, payload, error);
+            }));
+        }
+    }
+}
+
 /// Runtime configuration for the TCP listener
 pub enum RuntimeConfig {
     /// Use an existing tokio runtime handle.
@@ -302,6 +335,56 @@ impl TcpListener {
             warn!("Failed to set TCP keepalive on {}: {}", peer_addr, e);
         }
 
+        // Legacy senders can reuse a cached _hello after the receiver restarts.
+        // Preserve a connection-local response route without inventing peer
+        // identity/address registration or changing the wire format.
+        let (reply_tx, reply_rx) = flume::bounded::<ReplyFrame>(64);
+        let reply_gate = velo_ext::AdmissionGate::new(reply_tx, Handle::current());
+        let gate = reply_gate.clone();
+        let reply_metrics = metrics.clone();
+        let reply_runtime = Handle::current();
+        let route: Arc<velo_ext::transport::ReplyRoute> =
+            Arc::new(move |kind, header, payload, on_error| {
+                let frame_bytes = header.len() + payload.len();
+                let result = gate.send(ReplyFrame {
+                    kind,
+                    header,
+                    payload,
+                    on_error,
+                    runtime: reply_runtime.clone(),
+                    queued_at: reply_metrics.as_ref().map(|_| std::time::Instant::now()),
+                    completed: false,
+                    failure: None,
+                });
+                let Some(metrics) = reply_metrics.as_ref() else {
+                    return result;
+                };
+                match result {
+                    velo_ext::SendOutcome::Pending(admission) => {
+                        metrics.record_send_backpressure();
+                        let metrics = metrics.clone();
+                        velo_ext::SendOutcome::Pending(admission.on_resolved(move |result| {
+                            if result.is_ok() {
+                                metrics.record_frame(
+                                    velo_ext::Direction::Outbound,
+                                    crate::transports::message_type_label(kind),
+                                    frame_bytes,
+                                );
+                            }
+                        }))
+                    }
+                    admitted => {
+                        metrics.record_frame(
+                            velo_ext::Direction::Outbound,
+                            crate::transports::message_type_label(kind),
+                            frame_bytes,
+                        );
+                        admitted
+                    }
+                }
+            });
+        let adapter = adapter.with_reply_route(route);
+
         // Create framed stream with zero-copy codec
         let mut framed = Framed::new(stream, TcpFrameCodec::new());
         // Built once per connection: the token is node-wide, so a future
@@ -319,6 +402,29 @@ impl TcpListener {
                 _ = &mut teardown => {
                     debug!("Connection handler for {} torn down", peer_addr);
                     break;
+                }
+                reply = reply_rx.recv_async() => {
+                    let Ok(mut reply) = reply else { break; };
+                    if let (Some(metrics), Some(queued_at)) = (metrics.as_ref(), reply.queued_at) {
+                        metrics.record_egress_queue_wait(queued_at.elapsed());
+                    }
+                    let write_started = std::time::Instant::now();
+                    let written = tokio::select! {
+                        biased;
+                        _ = &mut teardown => break,
+                        result = TcpFrameCodec::encode_frame(framed.get_mut(), reply.kind, &reply.header, &reply.payload) => result,
+                    };
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_egress_write_duration(write_started.elapsed());
+                    }
+                    if let Err(error) = written {
+                        reply.failure = Some(error.to_string());
+                        break;
+                    }
+                    reply.completed = true;
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_frames_written(reply.kind, 1);
+                    }
                 }
                 frame_result = framed.next() => {
                     match frame_result {
@@ -389,6 +495,8 @@ impl TcpListener {
             }
         }
 
+        reply_gate.fail_all(velo_ext::AdmissionError::ChannelClosed);
+        while reply_rx.try_recv().is_ok() {}
         Ok(())
     }
 }
@@ -601,6 +709,114 @@ mod tests {
         fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
             eprintln!("Test error handler: {}", error);
         }
+    }
+
+    struct ReenteringReplyError {
+        gate: std::sync::OnceLock<velo_ext::AdmissionGate<ReplyFrame>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReenteringReplyError {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                gate: std::sync::OnceLock::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        async fn wait_for(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.calls.load(std::sync::atomic::Ordering::SeqCst) != count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reply failure callbacks did not complete");
+        }
+    }
+
+    impl TransportErrorHandler for ReenteringReplyError {
+        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+            // Takes the gate's queue lock: an inline Drop callback deadlocks.
+            let _ = self.gate.get().unwrap().queued_len();
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn reply_frame(errors: Arc<dyn TransportErrorHandler>) -> ReplyFrame {
+        ReplyFrame {
+            kind: MessageType::Response,
+            header: Bytes::from_static(b"header"),
+            payload: Bytes::from_static(b"payload"),
+            on_error: errors,
+            runtime: Handle::current(),
+            queued_at: None,
+            completed: false,
+            failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_reply_gate_reports_failure_without_calling_under_its_lock() {
+        let (tx, rx) = flume::bounded(1);
+        let gate = velo_ext::AdmissionGate::new(tx, Handle::current());
+        let errors = ReenteringReplyError::new();
+        errors.gate.set(gate.clone()).unwrap();
+        drop(rx);
+        let admission = gate
+            .send(reply_frame(errors.clone()))
+            .into_pending()
+            .unwrap();
+        assert_eq!(
+            admission.await,
+            Err(velo_ext::AdmissionError::ChannelClosed)
+        );
+        errors.wait_for(1).await;
+    }
+
+    #[tokio::test]
+    async fn pending_reply_cancellation_does_not_double_report_or_drop_the_admitted_reply() {
+        let (tx, rx) = flume::bounded(1);
+        let gate = velo_ext::AdmissionGate::new(tx, Handle::current());
+        let errors = ReenteringReplyError::new();
+        errors.gate.set(gate.clone()).unwrap();
+        assert!(gate.send(reply_frame(errors.clone())).is_admitted());
+        let pending = gate
+            .send(reply_frame(errors.clone()))
+            .into_pending()
+            .unwrap();
+        pending.cancel();
+        errors.wait_for(1).await;
+        let mut written = rx.try_recv().unwrap();
+        written.completed = true;
+        drop(written);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(errors.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reply_gate_teardown_reports_each_queued_frame_once() {
+        let (tx, rx) = flume::bounded(1);
+        let gate = velo_ext::AdmissionGate::new(tx, Handle::current());
+        let errors = ReenteringReplyError::new();
+        errors.gate.set(gate.clone()).unwrap();
+        assert!(gate.send(reply_frame(errors.clone())).is_admitted());
+        let pending: Vec<_> = (0..32)
+            .map(|_| {
+                gate.send(reply_frame(errors.clone()))
+                    .into_pending()
+                    .unwrap()
+            })
+            .collect();
+        gate.fail_all(velo_ext::AdmissionError::ChannelClosed);
+        for admission in pending {
+            assert_eq!(
+                admission.await,
+                Err(velo_ext::AdmissionError::ChannelClosed)
+            );
+        }
+        drop(rx.try_recv().unwrap());
+        errors.wait_for(33).await;
+        assert!(rx.try_recv().is_err());
     }
 
     /// A connection builds its teardown future once, not once per frame.

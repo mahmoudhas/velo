@@ -29,6 +29,33 @@ Velo registers each peer with every transport that the peer and the local instan
 
 A `WorkerAddress` is a MessagePack map from `TransportKey` to endpoint bytes. Each transport adds its own entry, and a peer reads the entries for the transports that it has.
 
+## TCP replies after a receiver restart
+
+A caller can keep its `_hello` cache after the receiver restarts on the same
+address. The caller then sends without another handshake, but the receiver has
+no registration for it. Routing a reply only through the peer registry loses
+that reply and leaves the caller waiting for its timeout. Prewarming later is
+not enough: requests can arrive before it finishes.
+
+An accepted TCP connection now supplies a weak, reply-only return path. If the
+sender is not registered, Response and Ack frames can go back on a live accepted
+connection from that worker. The caller's existing reader already understands
+these frames, so the wire format does not change. Registered peers still use
+their normal transport route. Return paths do not register an instance, authorize
+new outbound requests, or change rendezvous payload transfer.
+
+The fallback has a bounded send channel and an admission gate. Its writer checks
+teardown even while a write is blocked. Queued and interrupted replies report
+failure; their callbacks run outside the admission gate's locks. Routes hold no
+strong socket reference. Dead routes are ignored and pruned when another
+connection is learned. Inbound requests still pass through the normal drain
+admission gate.
+
+This fixes reply delivery, not peer-incarnation discovery or authentication.
+An application must still fence stale ownership and validate transferred data.
+The synthetic `tcp_restart_replies` tests cover repeated restarts, concurrent
+replies, typed replies, and handler/error replies without refreshing the caller.
+
 ## The transport contract
 
 Every transport implements the `Transport` trait from `velo-ext`. The runtime relies on these rules:
