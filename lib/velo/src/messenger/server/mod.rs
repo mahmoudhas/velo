@@ -18,7 +18,7 @@ use crate::messenger::common::{
 use std::sync::Arc;
 
 use crate::observability::{DispatchFailure, VeloMetrics};
-use crate::transports::{DataStreams, InboundMessage, ShutdownState, VeloBackend};
+use crate::transports::{DataStreams, InboundMessage, ReplySender, ShutdownState, VeloBackend};
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
@@ -238,6 +238,7 @@ async fn create_message_handler(
             header,
             payload,
             guard,
+            reply_route,
             ..
         } = inbound;
         // Held until the handler future (response send included) completes, so
@@ -298,6 +299,7 @@ async fn create_message_handler(
                                         response_type,
                                         headers,
                                         system,
+                                        reply_route,
                                         in_flight,
                                     };
                                     hub.dispatch_message(&handler_name, ctx);
@@ -314,7 +316,7 @@ async fn create_message_handler(
                                             | crate::messenger::common::messages::ResponseType::Unary
                                     ) {
                                         send_error_reply(
-                                            system.backend(),
+                                            &ReplySender::new(system.backend().clone(), reply_route),
                                             &handler_name,
                                             message_id,
                                             format!("Failed to resolve large payload: {e}"),
@@ -337,7 +339,7 @@ async fn create_message_handler(
                             crate::messenger::common::messages::ResponseType::AckNack
                                 | crate::messenger::common::messages::ResponseType::Unary
                         ) {
-                            let backend = system.backend().clone();
+                            let backend = ReplySender::new(system.backend().clone(), reply_route);
                             let handler_name = message.metadata.handler_name.clone();
                             let message_id = message.metadata.response_id;
                             tokio::spawn(async move {
@@ -361,6 +363,7 @@ async fn create_message_handler(
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
                     system,
+                    reply_route,
                     in_flight,
                 };
 

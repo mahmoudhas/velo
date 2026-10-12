@@ -60,6 +60,12 @@ async fn node(address: Option<SocketAddr>) -> (Arc<Messenger>, SocketAddr) {
             Handler::unary_handler("panic", |_| panic!("synthetic handler panic")).build(),
         )
         .unwrap();
+    messenger
+        .register_handler(Handler::am_handler("ack", |_| Ok(())).build())
+        .unwrap();
+    messenger
+        .register_handler(Handler::am_handler("nack", |_| anyhow::bail!("synthetic nack")).build())
+        .unwrap();
     if first_incarnation {
         messenger
             .register_handler(
@@ -129,6 +135,21 @@ async fn cached_caller_gets_replies_after_same_address_restart() {
     .unwrap()
     .unwrap();
     assert_eq!(typed, 42);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        caller.am_sync("ack").unwrap().instance(retired).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let nack = tokio::time::timeout(
+        Duration::from_secs(2),
+        caller.am_sync("nack").unwrap().instance(retired).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(nack.to_string().contains("synthetic nack"));
     // The current incarnation still supports the normal handshake/peer route.
     caller.register_peer(replacement.peer_info()).unwrap();
     assert_eq!(
@@ -190,6 +211,7 @@ async fn cached_caller_gets_negative_replies_without_a_timeout() {
         ("fail", "synthetic handler error"),
         ("panic", "handler panicked"),
         ("removed", "not found"),
+        ("typed", "Failed to deserialize input"),
     ] {
         let error = tokio::time::timeout(
             Duration::from_secs(2),

@@ -341,7 +341,10 @@ impl TcpListener {
         let (reply_tx, reply_rx) = flume::bounded::<ReplyFrame>(64);
         let reply_gate = velo_ext::AdmissionGate::new(reply_tx, Handle::current());
         let gate = reply_gate.clone();
-        let reply_metrics = metrics.clone();
+        // Preserve InboundMessage's unwind-safe capability contract. Observer
+        // hooks are diagnostic only: they cannot mutate route selection or the
+        // admission gate's invariants, and a panic abandons this invocation.
+        let reply_metrics = std::panic::AssertUnwindSafe(metrics.clone());
         let reply_runtime = Handle::current();
         let route: Arc<velo_ext::transport::ReplyRoute> =
             Arc::new(move |kind, header, payload, on_error| {

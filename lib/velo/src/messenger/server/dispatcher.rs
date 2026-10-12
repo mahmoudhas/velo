@@ -4,18 +4,18 @@
 //! Message dispatcher for active message routing.
 
 use crate::observability::{DispatchFailure, OrderedMetricsHandle};
-use crate::transports::VeloBackend;
+use crate::transports::{ReplySender, VeloBackend};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use tracing::{error, trace, warn};
-use velo_ext::WorkerId;
+use velo_ext::{WorkerId, transport::ReplyRoute};
 
 use crate::Messenger;
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
@@ -41,6 +41,10 @@ pub(crate) struct HandlerContext {
 
     /// The messenger system for handler access
     pub system: Arc<Messenger>,
+
+    /// Return capability from this request's accepted connection, attached only
+    /// after the entire active-message header has decoded successfully.
+    pub reply_route: Option<Weak<ReplyRoute>>,
 
     /// In-flight guard for graceful-shutdown drain tracking. Acquired when
     /// the message is pulled off the inbound channel; the handler wrapper
@@ -82,6 +86,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
     let message_id = ctx.message_id;
     let response_type = ctx.response_type;
     let system = Arc::clone(&ctx.system);
+    let reply_route = ctx.reply_route.clone();
     let in_flight = ctx.in_flight.clone();
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
@@ -109,6 +114,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
             message_id,
             response_type,
             "handler panicked",
+            reply_route,
             in_flight,
         )
         .await;
@@ -126,6 +132,7 @@ async fn fail_fast(
     message_id: ResponseId,
     response_type: ResponseType,
     reason: &'static str,
+    reply_route: Option<Weak<ReplyRoute>>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
 ) {
     if matches!(response_type, ResponseType::FireAndForget) {
@@ -133,7 +140,7 @@ async fn fail_fast(
     }
     let _in_flight = in_flight;
     send_error_reply(
-        system.backend(),
+        &ReplySender::new(system.backend().clone(), reply_route),
         handler,
         message_id,
         format!("Handler failed: {reason}"),
@@ -144,7 +151,7 @@ async fn fail_fast(
 /// Send an error response to the caller and log a failure to do so. Admission
 /// refusals are expected during shutdown, so they are not logged.
 pub(crate) async fn send_error_reply(
-    backend: &VeloBackend,
+    backend: &ReplySender,
     handler: &str,
     message_id: ResponseId,
     message: String,
@@ -467,6 +474,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 let system = system.clone();
                 let handler_name = self.handler.name().to_string();
                 let in_flight = shed.ctx.in_flight;
+                let reply_route = shed.ctx.reply_route;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
                         &system,
@@ -474,6 +482,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                         message_id,
                         response_type,
                         "ordered lane queue full",
+                        reply_route,
                         in_flight,
                     )
                     .await;
@@ -572,7 +581,7 @@ impl DispatcherHub {
             "No handler registered for message"
         );
 
-        let backend = self.backend.clone();
+        let backend = ReplySender::new(self.backend.clone(), ctx.reply_route);
         let message_id = ctx.message_id;
         let handler_name = handler_name.to_string();
 
@@ -596,7 +605,7 @@ impl DispatcherHub {
 
     /// Send an error response back to the sender (static method)
     async fn send_error_response_static(
-        backend: &VeloBackend,
+        backend: &ReplySender,
         response_id: ResponseId,
         error_message: String,
     ) -> anyhow::Result<()> {
@@ -755,6 +764,7 @@ mod tests {
             response_type: ResponseType::FireAndForget,
             headers: None,
             system: Arc::clone(&messenger),
+            reply_route: None,
             in_flight: None,
         };
 

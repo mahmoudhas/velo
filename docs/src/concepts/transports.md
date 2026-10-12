@@ -37,24 +37,34 @@ no registration for it. Routing a reply only through the peer registry loses
 that reply and leaves the caller waiting for its timeout. Prewarming later is
 not enough: requests can arrive before it finishes.
 
-An accepted TCP connection now supplies a weak, reply-only return path. If the
-sender is not registered, Response and Ack frames can go back on a live accepted
-connection from that worker. The caller's existing reader already understands
-these frames, so the wire format does not change. Registered peers still use
-their normal transport route. Return paths do not register an instance, authorize
-new outbound requests, or change rendezvous payload transfer.
+An accepted TCP connection supplies a weak, reply-only return capability carried
+with each admitted request. Only after the full active-message header decodes
+successfully can its handler or error path use that capability. If the sender
+is not registered, Response and Ack frames return on **that request's own
+connection**. There is no worker-wide or response-ID-indexed fallback registry:
+malformed frames, unrelated requests and even duplicate response IDs on other
+connections cannot redirect a pending reply. The caller's existing reader
+already understands these frames, so the wire format does not change.
+Registered peers still use their normal transport route. Return capabilities do
+not register an instance, authorize new outbound requests, or change rendezvous
+payload transfer.
 
 The fallback has a bounded send channel and an admission gate. Its writer checks
 teardown even while a write is blocked. Queued and interrupted replies report
-failure; their callbacks run outside the admission gate's locks. Routes hold no
-strong socket reference. Dead routes are ignored and pruned when another
-connection is learned. Inbound requests still pass through the normal drain
-admission gate.
+failure; their callbacks run outside the admission gate's locks. Request
+capabilities hold no strong socket reference. If the original connection closes,
+the reply fails rather than borrowing another connection with the same claimed
+identity. Inbound requests still pass through the normal drain admission gate.
+Blocked writes are teardown-cancellable but have no independent write deadline;
+malformed requests can be dropped without a reply, not universally fail-fast.
 
 This fixes reply delivery, not peer-incarnation discovery or authentication.
 An application must still fence stale ownership and validate transferred data.
 The synthetic `tcp_restart_replies` tests cover repeated restarts, concurrent
-replies, typed replies, and handler/error replies without refreshing the caller.
+replies, typed replies, ACK/NACKs and handler/error replies without refreshing
+the caller. `tcp_reply_scope` holds a legitimate reply pending while a second
+socket sends malformed headers, fire-and-forget traffic, or fully valid requests
+with duplicate worker/response IDs; each reply must stay on its own connection.
 
 ## The transport contract
 

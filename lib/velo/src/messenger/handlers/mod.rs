@@ -47,7 +47,7 @@ use crate::messenger::server::dispatcher::{
     ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, InlineDispatcher,
     OrderedDispatcher, SpawnedDispatcher,
 };
-use crate::transports::{MessageType, SendOutcome, VeloBackend};
+use crate::transports::{MessageType, ReplySender, SendOutcome};
 use derive_getters::Dissolve;
 use tokio_util::task::TaskTracker;
 
@@ -526,7 +526,7 @@ where
         #[cfg(feature = "distributed-tracing")]
         let span_name = name.clone();
 
-        let backend = ctx.system.backend().clone();
+        let backend = ReplySender::new(ctx.system.backend().clone(), ctx.reply_route.clone());
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
@@ -666,7 +666,7 @@ where
         };
 
         let executor = self.executor.clone();
-        let backend = ctx.system.backend().clone();
+        let backend = ReplySender::new(ctx.system.backend().clone(), ctx.reply_route.clone());
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
@@ -802,7 +802,7 @@ where
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
         let trace_headers = headers.clone();
-        let backend = ctx.system.backend().clone();
+        let backend = ReplySender::new(ctx.system.backend().clone(), ctx.reply_route.clone());
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let executor = self.executor.clone();
@@ -1011,7 +1011,7 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
         .clone()
 }
 
-async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<()> {
+async fn send_ack(backend: ReplySender, response_id: ResponseId) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
     let outcome = backend.send_message_to_worker(
@@ -1044,7 +1044,7 @@ fn handler_response_type(response_type: ResponseType) -> HandlerResponseType {
 }
 
 async fn send_nack(
-    backend: Arc<VeloBackend>,
+    backend: ReplySender,
     response_id: ResponseId,
     error_message: String,
 ) -> Result<()> {
@@ -1064,7 +1064,7 @@ async fn send_nack(
 }
 
 async fn send_response_ok(
-    backend: Arc<VeloBackend>,
+    backend: ReplySender,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
 ) -> Result<()> {
@@ -1084,7 +1084,7 @@ async fn send_response_ok(
 }
 
 async fn send_response(
-    backend: Arc<VeloBackend>,
+    backend: ReplySender,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     payload: Bytes,
@@ -1105,7 +1105,7 @@ async fn send_response(
 }
 
 async fn send_response_error(
-    backend: Arc<VeloBackend>,
+    backend: ReplySender,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     error_message: String,
